@@ -54,6 +54,31 @@ CHUNK_SEC = 0.1
 CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_SEC) * 2  # s16le mono
 
 
+def format_timestamp(seconds: float) -> str:
+    """Format seconds as HH:MM:SS.mmm for timestamped transcripts."""
+    total_ms = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def write_timestamped_transcript(path: Path, segments) -> int:
+    """Write segment timestamps and text, returning the number of segments."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with path.open("w", encoding="utf-8") as transcript:
+        for segment in segments:
+            text = segment.text.strip()
+            if not text:
+                continue
+            start = format_timestamp(float(segment.start))
+            end = format_timestamp(float(segment.end))
+            transcript.write(f"[{start} --> {end}] {text}\n")
+            count += 1
+    return count
+
+
 def default_font() -> str:
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -300,8 +325,9 @@ def check_ffmpeg(args, p: argparse.ArgumentParser) -> None:
 def main():
     p = argparse.ArgumentParser(description="Realtime Whisper subtitles on an RTSP stream.")
     p.add_argument("input", help="source: an rtsp:// URL, or a path to an MP4/video file (played once unless --loop is used)")
-    p.add_argument("output", help="destination RTSP URL or local output file (e.g. rtsp://localhost:8554/subtitled or output.mp4)")
+    p.add_argument("output", nargs="?", help="destination RTSP URL or local output file (optional with --transcribe-only)")
     p.add_argument("--loop", action="store_true", help="loop a local file source continuously")
+    p.add_argument("--transcribe-only", nargs="?", const="", metavar="TXT", help="transcribe a local input to timestamped text instead of creating output media; optional TXT path")
     p.add_argument("--model", default="base.en", help="tiny/base/small/medium/large-v3/turbo or *.en variants")
     p.add_argument("--device", default="auto", help="auto, cpu or cuda")
     p.add_argument("--compute-type", default="default", help="int8 (CPU), float16 (GPU), ...")
@@ -338,7 +364,15 @@ def main():
 
     if not is_rtsp(args.input) and not Path(args.input).is_file():
         p.error(f"input is neither an rtsp:// URL nor an existing file: {args.input}")
-    if not is_rtsp(args.output):
+    if args.transcribe_only is not None:
+        if is_rtsp(args.input):
+            p.error("--transcribe-only requires a local input file")
+        if args.output:
+            p.error("with --transcribe-only, specify the text file using --transcribe-only TXT, not the positional output")
+    elif args.output is None:
+        p.error("output is required unless --transcribe-only is used")
+
+    if args.output is not None and not is_rtsp(args.output):
         output_path = Path(args.output)
         if not output_path.suffix:
             p.error("local output files must include a filename extension, such as output.mp4")
@@ -351,7 +385,8 @@ def main():
     if WhisperModel is None:
         p.error("faster-whisper is required; install it with 'pip install faster-whisper'")
 
-    check_ffmpeg(args, p)
+    if args.transcribe_only is None:
+        check_ffmpeg(args, p)
 
     lang = None if args.language == "auto" else args.language
     print(f"Loading model {args.model}...")
@@ -359,6 +394,25 @@ def main():
         model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
     except Exception as exc:
         p.error(f"could not load Whisper model: {exc}")
+
+    if args.transcribe_only is not None:
+        transcript_path = Path(args.transcribe_only) if args.transcribe_only else Path(args.input).with_suffix(".txt")
+        print(f"Transcribing {args.input}...")
+        try:
+            segments, _ = model.transcribe(
+                args.input,
+                language=lang,
+                task=args.task,
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+            )
+            count = write_timestamped_transcript(transcript_path, segments)
+        except Exception as exc:
+            p.error(f"transcription failed: {exc}")
+        print(f"Wrote {count} timestamped segment(s) to {transcript_path}")
+        return
 
     def transcribe(audio: np.ndarray) -> str:
         segments, _ = model.transcribe(

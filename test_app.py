@@ -10,6 +10,20 @@ import app
 
 
 class AppTests(unittest.TestCase):
+    def test_format_timestamp(self):
+        self.assertEqual(app.format_timestamp(3661.234), "01:01:01.234")
+
+    def test_write_timestamped_transcript(self):
+        segment = SimpleNamespace(start=1.25, end=2.5, text=" Hello world ")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "transcript.txt"
+            count = app.write_timestamped_transcript(path, [segment])
+            self.assertEqual(count, 1)
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "[00:00:01.250 --> 00:00:02.500] Hello world\n",
+            )
+
     def test_stop_ffmpeg_sends_quit_before_wait(self):
         stdin = Mock()
         proc = Mock()
