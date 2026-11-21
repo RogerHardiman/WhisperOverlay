@@ -13,7 +13,7 @@ Setup:
     # a running mediamtx (https://github.com/bluenviron/mediamtx), default RTSP port 8554
 
 The source can be an RTSP URL or a local video file. A file is read at real-time
-speed (ffmpeg -re) and looped forever (-stream_loop -1), so it behaves like a live feed.
+speed (ffmpeg -re) and plays once by default. Use --loop to repeat it continuously.
 
 Usage:
     python rtsp_live_subtitles.py rtsp://camera/stream rtsp://localhost:8554/subtitled
@@ -41,12 +41,12 @@ from pathlib import Path
 
 try:
     import numpy as np
-except ImportError:
+except Exception:
     np = None
 
 try:
     from faster_whisper import WhisperModel
-except ImportError:
+except Exception:
     WhisperModel = None
 
 SAMPLE_RATE = 16000
@@ -115,6 +115,10 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
 
     cmd = [
         "ffmpeg", "-loglevel", "warning", "-nostats",
+    ]
+    if not is_rtsp(args.output) and not is_rtsp(args.input) and not args.loop:
+        cmd += ["-progress", "pipe:2"]
+    cmd += [
         *input_opts,
         "-i", args.input,
         # Output 1: overlaid video + audio
@@ -129,9 +133,6 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
         if Path(args.output).suffix.lower() in (".mp4", ".mov", ".m4v"):
             cmd += ["-movflags", "+faststart"]
         cmd += [args.output]
-
-    if not is_rtsp(args.output) and not is_rtsp(args.input) and not args.loop:
-        cmd += ["-progress", "pipe:2"]
 
     cmd += [
         # Output 2: raw audio to stdout for Whisper
@@ -162,15 +163,22 @@ def probe_duration(path: str) -> float:
 def progress_thread(pipe, duration: float):
     """Consume FFmpeg stderr and print percentage progress for finite file runs."""
     last_percent = -1
-    if duration <= 0:
-        for line in iter(pipe.readline, ""):
-            if line and not line.startswith(("frame=", "out_time=", "progress=")):
-                print(line.rstrip(), file=sys.stderr)
-        return
-
     values = {}
-    for raw_line in iter(pipe.readline, ""):
-        line = raw_line.strip()
+
+    while True:
+        raw_line = pipe.readline()
+        if not raw_line:
+            break
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8", errors="replace").strip()
+        else:
+            line = raw_line.strip()
+
+        if duration <= 0:
+            if line and not line.startswith(("frame=", "out_time=", "progress=")):
+                print(line, file=sys.stderr)
+            continue
+
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -306,6 +314,8 @@ def main():
         p.error(f"input is neither an rtsp:// URL nor an existing file: {args.input}")
     if not is_rtsp(args.output):
         output_path = Path(args.output)
+        if not output_path.suffix:
+            p.error("local output files must include a filename extension, such as output.mp4")
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -341,7 +351,12 @@ def main():
         progress_duration = probe_duration(args.input)
 
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
     except OSError as exc:
         shutil.rmtree(tmpdir, ignore_errors=True)
         p.error(f"could not start ffmpeg: {exc}")

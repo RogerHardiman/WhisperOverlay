@@ -56,6 +56,14 @@ class AppTests(unittest.TestCase):
         pipe = io.StringIO("out_time_us=5000000\nprogress=continue\nout_time_us=10000000\nprogress=end\n")
         app.progress_thread(pipe, 10.0)
 
+    def test_windows_drive_path_is_escaped(self):
+        escaped = app.ffmpeg_escape("C:\\Users\\Roger\\subtitles.txt")
+        self.assertEqual(escaped, r"C\:/Users/Roger/subtitles.txt")
+
+    def test_progress_thread_accepts_bytes(self):
+        pipe = io.BytesIO(b"out_time_us=5000000\nprogress=continue\nout_time_us=10000000\nprogress=end\n")
+        app.progress_thread(pipe, 10.0)
+
     def test_build_ffmpeg_cmd_supports_file_output(self):
         args = SimpleNamespace(
             font_size="36", margin=60, font="", encoder="libx264",
@@ -65,6 +73,8 @@ class AppTests(unittest.TestCase):
         cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))
         self.assertIn("-y", cmd)
         self.assertIn("+faststart", cmd)
+        self.assertIn("-progress", cmd)
+        self.assertIn("pipe:2", cmd)
         self.assertIn("/tmp/subtitles.mp4", cmd)
         self.assertNotIn("-rtsp_transport", cmd)
 
