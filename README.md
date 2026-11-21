@@ -33,6 +33,9 @@ standalone console window; headless command-line runs retain the console.
 The faster-whisper model is downloaded on first use and cached in the user's
 local Hugging Face cache, so the first run needs internet access. Models are
 large and are intentionally not embedded in the executable.
+In the desktop app, select a model to see whether it is already cached, or use
+**Download model** to fetch it before starting a stream. The progress bar shows
+the percentage downloaded for the current model file.
 
 To run from source during development, install `requirements.txt` and run
 `python app.py` (with FFmpeg available on `PATH`).

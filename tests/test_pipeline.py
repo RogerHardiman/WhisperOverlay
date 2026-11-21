@@ -1,8 +1,16 @@
+import sys
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cli_mode import _argument_parser
-from whisper_overlay import PipelineConfig, build_output_command
+from whisper_overlay import (
+    PipelineConfig,
+    build_output_command,
+    download_model,
+    is_model_downloaded,
+)
 
 
 class PipelineCommandTests(unittest.TestCase):
@@ -96,6 +104,60 @@ class PipelineCommandTests(unittest.TestCase):
         self.assertEqual(args.model, "medium")
         self.assertEqual(args.audio_mode, "copy")
         self.assertTrue(args.loop_file)
+
+
+class ModelDownloadTests(unittest.TestCase):
+    def test_cache_check_reports_missing_model(self) -> None:
+        class LocalEntryNotFoundError(Exception):
+            pass
+
+        hub = types.ModuleType("huggingface_hub")
+        hub.__path__ = []
+        errors = types.ModuleType("huggingface_hub.errors")
+        errors.LocalEntryNotFoundError = LocalEntryNotFoundError
+        snapshot_download = unittest.mock.Mock(side_effect=LocalEntryNotFoundError)
+
+        with patch.dict(
+            sys.modules,
+            {"huggingface_hub": hub, "huggingface_hub.errors": errors},
+        ), patch("whisper_overlay._snapshot_download_function", return_value=snapshot_download):
+            self.assertFalse(is_model_downloaded("small"))
+
+        snapshot_download.assert_called_once_with(
+            "Systran/faster-whisper-small", local_files_only=True
+        )
+
+    def test_download_reports_percentage_for_current_file(self) -> None:
+        class FakeTqdm:
+            def __init__(self, total: int, desc: str) -> None:
+                self.total = total
+                self.desc = desc
+                self.n = 0
+
+            def update(self, amount: int = 1) -> bool:
+                self.n += amount
+                return True
+
+        utils = types.ModuleType("huggingface_hub.utils")
+        utils.tqdm = FakeTqdm
+        hub = types.ModuleType("huggingface_hub")
+        hub.__path__ = []
+        progress: list[tuple[int, str]] = []
+
+        def fake_snapshot_download(repo_id: str, *, tqdm_class: type) -> None:
+            self.assertEqual(repo_id, "Systran/faster-whisper-base")
+            tqdm_class(total=4, desc="model.bin").update(2)
+
+        with patch.dict(
+            sys.modules,
+            {"huggingface_hub": hub, "huggingface_hub.utils": utils},
+        ), patch(
+            "whisper_overlay._snapshot_download_function",
+            return_value=fake_snapshot_download,
+        ):
+            download_model("base", lambda percent, filename: progress.append((percent, filename)))
+
+        self.assertEqual(progress, [(50, "model.bin")])
 
 
 if __name__ == "__main__":

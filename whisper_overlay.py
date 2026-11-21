@@ -13,6 +13,48 @@ from typing import Callable
 
 
 LogCallback = Callable[[str], None]
+ModelProgressCallback = Callable[[int, str], None]
+
+MODEL_REPOSITORIES = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large-v3": "Systran/faster-whisper-large-v3",
+}
+
+
+def _snapshot_download_function():
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download
+
+
+def is_model_downloaded(model_size: str) -> bool:
+    repo_id = MODEL_REPOSITORIES[model_size]
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        _snapshot_download_function()(repo_id, local_files_only=True)
+    except LocalEntryNotFoundError:
+        return False
+    return True
+
+
+def download_model(model_size: str, on_progress: ModelProgressCallback) -> None:
+    from huggingface_hub.utils import tqdm
+
+    repo_id = MODEL_REPOSITORIES[model_size]
+
+    class ProgressBar(tqdm):
+        def update(self, n: int = 1) -> bool:
+            updated = super().update(n)
+            if self.total:
+                percent = min(100, int(self.n * 100 / self.total))
+                on_progress(percent, str(self.desc or "model files"))
+            return updated
+
+    _snapshot_download_function()(repo_id, tqdm_class=ProgressBar)
 
 
 def default_ffmpeg_path() -> str:

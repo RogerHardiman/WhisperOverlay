@@ -7,7 +7,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from cli_mode import hide_standalone_console, run_headless_if_requested
-from whisper_overlay import PipelineConfig, WhisperOverlayPipeline
+from whisper_overlay import (
+    MODEL_REPOSITORIES,
+    PipelineConfig,
+    WhisperOverlayPipeline,
+    download_model,
+    is_model_downloaded,
+)
 
 
 class WhisperOverlayApp:
@@ -70,16 +76,32 @@ class WhisperOverlayApp:
             frame, textvariable=self.audio_mode, values=("AAC", "Pass through"), state="readonly", width=16
         ).grid(row=8, column=1, sticky="w", pady=4)
         ttk.Label(frame, text="Whisper model").grid(row=9, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Combobox(
+        self.model_selector = ttk.Combobox(
             frame,
             textvariable=self.model_size,
-            values=("tiny", "base", "small", "medium", "large-v3"),
+            values=tuple(MODEL_REPOSITORIES),
             state="readonly",
             width=16,
-        ).grid(row=9, column=1, sticky="w", pady=4)
+        )
+        self.model_selector.grid(row=9, column=1, sticky="w", pady=4)
+        self.model_selector.bind("<<ComboboxSelected>>", self._update_model_status)
+
+        model_actions = ttk.Frame(frame)
+        model_actions.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(2, 4))
+        self.download_button = ttk.Button(
+            model_actions, text="Download model", command=self._download_model
+        )
+        self.download_button.pack(side=tk.LEFT)
+        self.model_status = tk.StringVar(value="Checking model...")
+        ttk.Label(model_actions, textvariable=self.model_status).pack(side=tk.LEFT, padx=(10, 0))
+
+        self.download_progress = ttk.Progressbar(
+            frame, orient=tk.HORIZONTAL, mode="determinate", maximum=100
+        )
+        self.download_progress.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(0, 4))
 
         actions = ttk.Frame(frame)
-        actions.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        actions.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(8, 8))
         self.start_button = ttk.Button(actions, text="Start", command=self._start)
         self.start_button.pack(side=tk.LEFT)
         self.stop_button = ttk.Button(actions, text="Stop", command=self._stop, state=tk.DISABLED)
@@ -87,11 +109,29 @@ class WhisperOverlayApp:
         self.status = tk.StringVar(value="Ready")
         ttk.Label(actions, textvariable=self.status).pack(side=tk.RIGHT)
 
-        ttk.Label(frame, text="Activity").grid(row=11, column=0, columnspan=3, sticky="w", pady=(6, 4))
+        ttk.Label(frame, text="Activity").grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 4))
         self.log = tk.Text(frame, height=12, wrap=tk.WORD, state=tk.DISABLED)
-        self.log.grid(row=12, column=0, columnspan=3, sticky="nsew")
-        frame.rowconfigure(12, weight=1)
+        self.log.grid(row=14, column=0, columnspan=3, sticky="nsew")
+        frame.rowconfigure(14, weight=1)
         self._update_browse_buttons()
+        self._update_model_status()
+
+    def _update_model_status(self, _event: object = None) -> None:
+        model = self.model_size.get()
+        try:
+            downloaded = is_model_downloaded(model)
+        except Exception as error:
+            self.model_status.set(f"Could not check model cache: {error}")
+            self.download_button.configure(state=tk.NORMAL)
+            return
+
+        self.model_status.set(
+            f"'{model}' is already downloaded." if downloaded else f"'{model}' is not downloaded."
+        )
+        self.download_button.configure(
+            text="Downloaded" if downloaded else "Download model",
+            state=tk.DISABLED if downloaded else tk.NORMAL,
+        )
 
     def _update_browse_buttons(self, _event: object = None) -> None:
         self.input_browse.configure(state=tk.NORMAL if self.input_kind.get() == "FILE" else tk.DISABLED)
@@ -140,6 +180,50 @@ class WhisperOverlayApp:
         self.stop_button.configure(state=tk.NORMAL)
         self.status.set("Starting")
         threading.Thread(target=self._run_pipeline, args=(self.pipeline,), daemon=True).start()
+
+    def _download_model(self) -> None:
+        model = self.model_size.get()
+        self.download_button.configure(state=tk.DISABLED)
+        self.model_selector.configure(state=tk.DISABLED)
+        self.start_button.configure(state=tk.DISABLED)
+        self.download_progress.configure(value=0)
+        self.model_status.set(f"Downloading '{model}'...")
+        threading.Thread(
+            target=self._download_model_worker, args=(model,), daemon=True
+        ).start()
+
+    def _download_model_worker(self, model: str) -> None:
+        try:
+            download_model(
+                model,
+                lambda percent, filename: self.root.after(
+                    0, self._set_download_progress, model, percent, filename
+                ),
+            )
+        except Exception as error:
+            self.root.after(0, self._download_finished, model, str(error))
+        else:
+            self.root.after(0, self._download_finished, model, None)
+
+    def _set_download_progress(self, model: str, percent: int, filename: str) -> None:
+        if self.model_size.get() != model:
+            return
+        self.download_progress.configure(value=percent)
+        self.model_status.set(f"Downloading '{model}': {percent}% ({filename})")
+
+    def _download_finished(self, model: str, error: str | None) -> None:
+        self.model_selector.configure(state="readonly")
+        self.start_button.configure(state=tk.NORMAL)
+        if error is not None:
+            self.download_progress.configure(value=0)
+            self.model_status.set(f"Download failed: {error}")
+            self.download_button.configure(text="Download model", state=tk.NORMAL)
+            self._append_log(f"Model download failed: {error}")
+            return
+
+        self.download_progress.configure(value=100)
+        self._update_model_status()
+        self._append_log(f"Model '{model}' downloaded and cached.")
 
     def _run_pipeline(self, pipeline: WhisperOverlayPipeline) -> None:
         pipeline.run()
