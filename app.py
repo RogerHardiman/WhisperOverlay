@@ -207,6 +207,32 @@ def progress_thread(pipe, duration: float):
                 values.clear()
 
 
+def stop_ffmpeg(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    """Ask FFmpeg to quit gracefully so local muxers can write the MP4 moov atom."""
+    if proc.poll() is not None:
+        return
+
+    if proc.stdin is not None:
+        try:
+            proc.stdin.write(b"q\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def reader_thread(pipe, q: queue.Queue):
     """Drain ffmpeg stdout and preserve partial PCM reads across read boundaries."""
     pending = bytearray()
@@ -353,6 +379,7 @@ def main():
     try:
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=False,
@@ -477,12 +504,7 @@ def main():
     finally:
         subs.set("")
         transcription_q.put(None)
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        stop_ffmpeg(proc)
         shutil.rmtree(tmpdir, ignore_errors=True)
         print("Stopped.")
 
