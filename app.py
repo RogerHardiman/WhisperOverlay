@@ -1,268 +1,387 @@
-from __future__ import annotations
+"""
+Realtime subtitles for an RTSP stream.
 
+  RTSP source --> ffmpeg --+--> video (drawtext overlay, re-encoded) + audio --> RTSP server (e.g. mediamtx)
+                           |
+                           +--> 16 kHz mono PCM --> faster-whisper --> subtitle text file
+                                                                            ^
+                                      ffmpeg's drawtext re-reads this file every frame (reload=1)
+
+Setup:
+    pip install -U faster-whisper numpy
+    # ffmpeg on PATH (built with libx264 and freetype/drawtext, which standard builds have)
+    # a running mediamtx (https://github.com/bluenviron/mediamtx), default RTSP port 8554
+
+The source can be an RTSP URL or a local video file. A file is read at real-time
+speed (ffmpeg -re) and looped forever (-stream_loop -1), so it behaves like a live feed.
+
+Usage:
+    python rtsp_live_subtitles.py rtsp://camera/stream rtsp://localhost:8554/subtitled
+    python rtsp_live_subtitles.py video.mp4 rtsp://localhost:8554/subtitled
+    python rtsp_live_subtitles.py video.mp4 OUT --no-loop     # play the file once
+    python rtsp_live_subtitles.py IN OUT --model small.en --language en --device cuda
+    python rtsp_live_subtitles.py IN OUT --encoder h264_nvenc
+
+Watch:
+    ffplay rtsp://localhost:8554/subtitled
+"""
+import argparse
+import os
+import queue
+import shutil
+import subprocess
 import sys
+import tempfile
+import textwrap
 import threading
-import tkinter as tk
+import time
+from collections import deque
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 
-from cli_mode import hide_standalone_console, run_headless_if_requested
-from whisper_overlay import (
-    MODEL_REPOSITORIES,
-    PipelineConfig,
-    WhisperOverlayPipeline,
-    download_model,
-    is_model_downloaded,
-)
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
+SAMPLE_RATE = 16000
+CHUNK_SEC = 0.1
+CHUNK_BYTES = int(SAMPLE_RATE * CHUNK_SEC) * 2  # s16le mono
 
 
-class WhisperOverlayApp:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("WhisperOverlay")
-        self.root.minsize(720, 540)
-        self.pipeline: WhisperOverlayPipeline | None = None
+def default_font() -> str:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+    ]
+    return next((c for c in candidates if Path(c).exists()), "")
 
-        self.input_kind = tk.StringVar(value="FILE")
-        self.input_source = tk.StringVar()
-        self.output_kind = tk.StringVar(value="FILE")
-        self.output_destination = tk.StringVar()
-        self.audio_mode = tk.StringVar(value="AAC")
-        self.model_size = tk.StringVar(value="small")
-        self.loop_file = tk.BooleanVar(value=False)
 
-        self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self._close)
+def is_rtsp(src: str) -> bool:
+    return src.lower().startswith(("rtsp://", "rtsps://"))
 
-    def _build_ui(self) -> None:
-        frame = ttk.Frame(self.root, padding=16)
-        frame.pack(fill=tk.BOTH, expand=True)
-        frame.columnconfigure(1, weight=1)
 
-        ttk.Label(frame, text="Input").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        ttk.Label(frame, text="Source type").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
-        input_type = ttk.Combobox(
-            frame, textvariable=self.input_kind, values=("FILE", "RTSP"), state="readonly", width=12
-        )
-        input_type.grid(row=1, column=1, sticky="w", pady=4)
-        input_type.bind("<<ComboboxSelected>>", self._update_browse_buttons)
+def ffmpeg_escape(path: str) -> str:
+    """Escape a path for use inside a filtergraph option value."""
+    return path.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
 
-        ttk.Label(frame, text="Video source").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Entry(frame, textvariable=self.input_source).grid(row=2, column=1, sticky="ew", pady=4)
-        self.input_browse = ttk.Button(frame, text="Browse...", command=self._browse_input)
-        self.input_browse.grid(row=2, column=2, padx=(8, 0), pady=4)
 
-        self.loop_checkbox = ttk.Checkbutton(
-            frame, text="Loop file indefinitely (real-time)", variable=self.loop_file
-        )
-        self.loop_checkbox.grid(row=3, column=1, sticky="w", pady=4)
+class SubtitleFile:
+    """Atomically updated text file that ffmpeg's drawtext reloads every frame."""
 
-        ttk.Separator(frame).grid(row=4, column=0, columnspan=3, sticky="ew", pady=12)
-        ttk.Label(frame, text="Output").grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        ttk.Label(frame, text="Destination type").grid(row=6, column=0, sticky="w", padx=(0, 10), pady=4)
-        output_type = ttk.Combobox(
-            frame, textvariable=self.output_kind, values=("FILE", "RTSP"), state="readonly", width=12
-        )
-        output_type.grid(row=6, column=1, sticky="w", pady=4)
-        output_type.bind("<<ComboboxSelected>>", self._update_browse_buttons)
+    def __init__(self, path: Path, width: int):
+        self.path, self.width, self.current = path, width, None
+        self.set("")
 
-        ttk.Label(frame, text="Video destination").grid(row=7, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Entry(frame, textvariable=self.output_destination).grid(row=7, column=1, sticky="ew", pady=4)
-        self.output_browse = ttk.Button(frame, text="Browse...", command=self._browse_output)
-        self.output_browse.grid(row=7, column=2, padx=(8, 0), pady=4)
+    def set(self, text: str):
+        text = "\n".join(textwrap.wrap(text.strip(), self.width)[-2:]) or " "  # last 2 lines only
+        if text == self.current:
+            return
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, self.path)  # atomic: drawtext never sees a half-written file
+        self.current = text
 
-        ttk.Label(frame, text="Audio").grid(row=8, column=0, sticky="w", padx=(0, 10), pady=4)
-        ttk.Combobox(
-            frame, textvariable=self.audio_mode, values=("AAC", "Pass through"), state="readonly", width=16
-        ).grid(row=8, column=1, sticky="w", pady=4)
-        ttk.Label(frame, text="Whisper model").grid(row=9, column=0, sticky="w", padx=(0, 10), pady=4)
-        self.model_selector = ttk.Combobox(
-            frame,
-            textvariable=self.model_size,
-            values=tuple(MODEL_REPOSITORIES),
-            state="readonly",
-            width=16,
-        )
-        self.model_selector.grid(row=9, column=1, sticky="w", pady=4)
-        self.model_selector.bind("<<ComboboxSelected>>", self._update_model_status)
 
-        model_actions = ttk.Frame(frame)
-        model_actions.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(2, 4))
-        self.download_button = ttk.Button(
-            model_actions, text="Download model", command=self._download_model
-        )
-        self.download_button.pack(side=tk.LEFT)
-        self.model_status = tk.StringVar(value="Checking model...")
-        ttk.Label(model_actions, textvariable=self.model_status).pack(side=tk.LEFT, padx=(10, 0))
+def build_ffmpeg_cmd(args, subfile: Path) -> list:
+    drawtext = (
+        f"drawtext=textfile='{ffmpeg_escape(str(subfile))}':reload=1:expansion=none"
+        f":fontcolor=white:fontsize={args.font_size}:borderw=3:bordercolor=black"
+        f":x=(w-text_w)/2:y=h-text_h-{args.margin}:line_spacing=6"
+    )
+    if args.font:
+        drawtext += f":fontfile='{ffmpeg_escape(args.font)}'"
 
-        self.download_progress = ttk.Progressbar(
-            frame, orient=tk.HORIZONTAL, mode="determinate", maximum=100
-        )
-        self.download_progress.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+    venc = ["-c:v", args.encoder, "-pix_fmt", "yuv420p", "-g", str(args.gop), "-b:v", args.bitrate]
+    if args.encoder == "libx264":
+        venc += ["-preset", "veryfast", "-tune", "zerolatency"]
 
-        actions = ttk.Frame(frame)
-        actions.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(8, 8))
-        self.start_button = ttk.Button(actions, text="Start", command=self._start)
-        self.start_button.pack(side=tk.LEFT)
-        self.stop_button = ttk.Button(actions, text="Stop", command=self._stop, state=tk.DISABLED)
-        self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.status = tk.StringVar(value="Ready")
-        ttk.Label(actions, textvariable=self.status).pack(side=tk.RIGHT)
+    if is_rtsp(args.input):
+        # Live source: low-latency flags
+        input_opts = ["-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay"]
+    else:
+        # File source: -re paces reading at native frame rate (real time);
+        # -stream_loop -1 repeats forever with continuous timestamps.
+        input_opts = ["-re"]
+        if not args.no_loop:
+            input_opts += ["-stream_loop", "-1"]
 
-        ttk.Label(frame, text="Activity").grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 4))
-        self.log = tk.Text(frame, height=12, wrap=tk.WORD, state=tk.DISABLED)
-        self.log.grid(row=14, column=0, columnspan=3, sticky="nsew")
-        frame.rowconfigure(14, weight=1)
-        self._update_browse_buttons()
-        self._update_model_status()
+    return [
+        "ffmpeg", "-loglevel", "warning", "-nostats",
+        *input_opts,
+        "-i", args.input,
+        # Output 1: overlaid video + audio to the RTSP server
+        "-map", "0:v:0", "-map", "0:a:0?", "-vf", drawtext, *venc,
+        "-c:a", "aac", "-b:a", "128k",
+        "-f", "rtsp", "-rtsp_transport", "tcp", args.output,
+        # Output 2: raw audio to stdout for Whisper
+        "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1",
+    ]
 
-    def _update_model_status(self, _event: object = None) -> None:
-        model = self.model_size.get()
+
+def reader_thread(pipe, q: queue.Queue):
+    """Drain ffmpeg stdout and preserve partial PCM reads across read boundaries."""
+    pending = bytearray()
+    while True:
+        data = pipe.read(CHUNK_BYTES)
+        if not data:
+            if pending:
+                padded = bytes(pending).ljust(CHUNK_BYTES, b"\0")
+                chunk = np.frombuffer(padded, np.int16).astype(np.float32) / 32768.0
+                put_chunk(q, chunk)
+            q.put(None)
+            return
+
+        pending.extend(data)
+        while len(pending) >= CHUNK_BYTES:
+            chunk_bytes = bytes(pending[:CHUNK_BYTES])
+            del pending[:CHUNK_BYTES]
+            put_chunk(q, np.frombuffer(chunk_bytes, np.int16).astype(np.float32) / 32768.0)
+
+
+def put_chunk(q: queue.Queue, chunk: "np.ndarray"):
+    """Keep the newest audio when the consumer is too slow."""
+    try:
+        q.put_nowait(chunk)
+    except queue.Full:
         try:
-            downloaded = is_model_downloaded(model)
-        except Exception as error:
-            self.model_status.set(f"Could not check model cache: {error}")
-            self.download_button.configure(state=tk.NORMAL)
-            return
-
-        self.model_status.set(
-            f"'{model}' is already downloaded." if downloaded else f"'{model}' is not downloaded."
-        )
-        self.download_button.configure(
-            text="Downloaded" if downloaded else "Download model",
-            state=tk.DISABLED if downloaded else tk.NORMAL,
-        )
-
-    def _update_browse_buttons(self, _event: object = None) -> None:
-        self.input_browse.configure(state=tk.NORMAL if self.input_kind.get() == "FILE" else tk.DISABLED)
-        self.loop_checkbox.configure(state=tk.NORMAL if self.input_kind.get() == "FILE" else tk.DISABLED)
-        self.output_browse.configure(state=tk.NORMAL if self.output_kind.get() == "FILE" else tk.DISABLED)
-
-    def _browse_input(self) -> None:
-        path = filedialog.askopenfilename(
-            filetypes=(("Video files", "*.mp4 *.mkv *.mov *.avi *.ts"), ("All files", "*.*"))
-        )
-        if path:
-            self.input_source.set(path)
-
-    def _browse_output(self) -> None:
-        path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=(("MP4 video", "*.mp4"), ("Matroska video", "*.mkv"), ("All files", "*.*")),
-        )
-        if path:
-            self.output_destination.set(path)
-
-    def _start(self) -> None:
-        source = self.input_source.get().strip()
-        destination = self.output_destination.get().strip()
-        if not source or not destination:
-            messagebox.showerror("Missing path", "Enter both an input source and an output destination.")
-            return
-        if self.input_kind.get() == "FILE" and not Path(source).is_file():
-            messagebox.showerror("Input file not found", f"The input file does not exist:\n{source}")
-            return
-        if self.output_kind.get() == "FILE" and not Path(destination).parent.is_dir():
-            messagebox.showerror("Output folder not found", "Choose an existing folder for the output file.")
-            return
-
-        config = PipelineConfig(
-            input_kind=self.input_kind.get(),
-            input_source=source,
-            output_kind=self.output_kind.get(),
-            output_destination=destination,
-            audio_mode=self.audio_mode.get(),
-            model_size=self.model_size.get(),
-            loop_input=self.input_kind.get() == "FILE" and self.loop_file.get(),
-        )
-        self.pipeline = WhisperOverlayPipeline(config, self._log_from_thread)
-        self.start_button.configure(state=tk.DISABLED)
-        self.stop_button.configure(state=tk.NORMAL)
-        self.status.set("Starting")
-        threading.Thread(target=self._run_pipeline, args=(self.pipeline,), daemon=True).start()
-
-    def _download_model(self) -> None:
-        model = self.model_size.get()
-        self.download_button.configure(state=tk.DISABLED)
-        self.model_selector.configure(state=tk.DISABLED)
-        self.start_button.configure(state=tk.DISABLED)
-        self.download_progress.configure(value=0)
-        self.model_status.set(f"Downloading '{model}'...")
-        threading.Thread(
-            target=self._download_model_worker, args=(model,), daemon=True
-        ).start()
-
-    def _download_model_worker(self, model: str) -> None:
+            q.get_nowait()
+        except queue.Empty:
+            pass
         try:
-            download_model(
-                model,
-                lambda percent, filename: self.root.after(
-                    0, self._set_download_progress, model, percent, filename
-                ),
-            )
-        except Exception as error:
-            self.root.after(0, self._download_finished, model, str(error))
+            q.put_nowait(chunk)
+        except queue.Full:
+            pass
+
+
+def check_ffmpeg(args, p: argparse.ArgumentParser) -> None:
+    """Fail fast for missing FFmpeg executables, filters, or encoders."""
+    if shutil.which("ffmpeg") is None:
+        p.error("ffmpeg is not on PATH")
+
+    try:
+        filters = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        ).stdout
+        encoders = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        ).stdout
+    except OSError as exc:
+        p.error(f"could not inspect ffmpeg: {exc}")
+
+    if " drawtext " not in filters:
+        p.error("ffmpeg was built without the drawtext filter")
+    if args.encoder not in encoders:
+        p.error(f"ffmpeg does not provide the requested {args.encoder!r} encoder")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Realtime Whisper subtitles on an RTSP stream.")
+    p.add_argument("input", help="source: an rtsp:// URL, or a path to an MP4/video file (loops forever, real time)")
+    p.add_argument("output", help="destination RTSP URL (e.g. rtsp://localhost:8554/subtitled)")
+    p.add_argument("--no-loop", action="store_true", help="play a file source once instead of looping")
+    p.add_argument("--model", default="base.en", help="tiny/base/small/medium/large-v3/turbo or *.en variants")
+    p.add_argument("--device", default="auto", help="auto, cpu or cuda")
+    p.add_argument("--compute-type", default="default", help="int8 (CPU), float16 (GPU), ...")
+    p.add_argument("--language", default="en", help="language code, or 'auto'")
+    p.add_argument("--task", choices=["transcribe", "translate"], default="transcribe")
+    # segmentation
+    p.add_argument("--vad-threshold", type=float, default=0.01, help="RMS level counted as speech (0-1)")
+    p.add_argument("--end-silence", type=float, default=0.7, help="seconds of silence that end an utterance")
+    p.add_argument("--max-utterance", type=float, default=12.0, help="force a cut after this many seconds")
+    p.add_argument("--partial-interval", type=float, default=1.0, help="seconds between live partial updates")
+    p.add_argument("--hold", type=float, default=3.0, help="seconds to keep text on screen after speech ends")
+    # look and encoding
+    p.add_argument("--font", default=default_font(), help="path to a .ttf font")
+    p.add_argument("--font-size", default="36")
+    p.add_argument("--margin", type=int, default=60, help="pixels from bottom edge")
+    p.add_argument("--wrap", type=int, default=42, help="characters per subtitle line")
+    p.add_argument("--encoder", default="libx264", help="libx264, h264_nvenc, h264_qsv, h264_videotoolbox...")
+    p.add_argument("--bitrate", default="3M")
+    p.add_argument("--gop", type=int, default=50)
+    args = p.parse_args()
+
+    if args.vad_threshold < 0 or args.vad_threshold > 1:
+        p.error("--vad-threshold must be between 0 and 1")
+    if args.end_silence < 0:
+        p.error("--end-silence must be non-negative")
+    if args.max_utterance <= 0:
+        p.error("--max-utterance must be greater than 0")
+    if args.partial_interval <= 0:
+        p.error("--partial-interval must be greater than 0")
+    if args.hold < 0:
+        p.error("--hold must be non-negative")
+    if args.wrap <= 0:
+        p.error("--wrap must be greater than 0")
+
+    if not is_rtsp(args.input) and not Path(args.input).is_file():
+        p.error(f"input is neither an rtsp:// URL nor an existing file: {args.input}")
+    if np is None:
+        p.error("numpy is required; install it with 'pip install numpy'")
+    if WhisperModel is None:
+        p.error("faster-whisper is required; install it with 'pip install faster-whisper'")
+
+    check_ffmpeg(args, p)
+
+    lang = None if args.language == "auto" else args.language
+    print(f"Loading model {args.model}...")
+    try:
+        model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
+    except Exception as exc:
+        p.error(f"could not load Whisper model: {exc}")
+
+    def transcribe(audio: np.ndarray) -> str:
+        segments, _ = model.transcribe(
+            audio, language=lang, task=args.task, beam_size=1, vad_filter=True,
+            condition_on_previous_text=False, no_speech_threshold=0.6,
+        )
+        return " ".join(s.text.strip() for s in segments).strip()
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="rtsp_subs_"))
+    subs = SubtitleFile(tmpdir / "subtitle.txt", args.wrap)
+
+    cmd = build_ffmpeg_cmd(args, subs.path)
+    print("Starting ffmpeg...")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    except OSError as exc:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        p.error(f"could not start ffmpeg: {exc}")
+
+    q: queue.Queue = queue.Queue(maxsize=50)
+    transcription_q: queue.Queue = queue.Queue(maxsize=2)
+    transcription_results: queue.Queue = queue.Queue()
+
+    def transcription_worker():
+        while True:
+            job = transcription_q.get()
+            if job is None:
+                return
+            kind, request_id, audio = job
+            try:
+                text = transcribe(audio)
+            except Exception as exc:
+                print(f"warning: transcription failed: {exc}", file=sys.stderr)
+                text = ""
+            transcription_results.put((kind, request_id, text))
+
+    threading.Thread(target=reader_thread, args=(proc.stdout, q), daemon=True).start()
+    threading.Thread(target=transcription_worker, daemon=True).start()
+
+    preroll = deque(maxlen=3)
+    buf: list = []
+    active = False
+    silence = 0.0
+    last_partial = 0.0
+    clear_at = 0.0
+    request_id = 0
+    latest_partial_id = -1
+    print(f"Running. Output: {args.output}   (Ctrl+C to stop)")
+
+    def enqueue_transcription(kind: str, audio: np.ndarray) -> int:
+        nonlocal request_id
+        request_id += 1
+        job = (kind, request_id, np.ascontiguousarray(audio))
+        if kind == "final":
+            try:
+                transcription_q.put_nowait(job)
+            except queue.Full:
+                try:
+                    transcription_q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    transcription_q.put_nowait(job)
+                except queue.Full:
+                    pass
         else:
-            self.root.after(0, self._download_finished, model, None)
+            try:
+                transcription_q.put_nowait(job)
+            except queue.Full:
+                pass
+        return request_id
 
-    def _set_download_progress(self, model: str, percent: int, filename: str) -> None:
-        if self.model_size.get() != model:
-            return
-        self.download_progress.configure(value=percent)
-        self.model_status.set(f"Downloading '{model}': {percent}% ({filename})")
+    try:
+        while True:
+            while True:
+                try:
+                    kind, result_id, text = transcription_results.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "partial":
+                    if result_id == latest_partial_id and text:
+                        subs.set(text)
+                elif text:
+                    subs.set(text)
+                    clear_at = time.monotonic() + args.hold
+                else:
+                    subs.set("")
+                    clear_at = 0.0
 
-    def _download_finished(self, model: str, error: str | None) -> None:
-        self.model_selector.configure(state="readonly")
-        self.start_button.configure(state=tk.NORMAL)
-        if error is not None:
-            self.download_progress.configure(value=0)
-            self.model_status.set(f"Download failed: {error}")
-            self.download_button.configure(text="Download model", state=tk.NORMAL)
-            self._append_log(f"Model download failed: {error}")
-            return
+            try:
+                chunk = q.get(timeout=0.5)
+            except queue.Empty:
+                chunk = np.zeros(0, np.float32)
+                if proc.poll() is not None:
+                    break
+            if chunk is None:
+                break
 
-        self.download_progress.configure(value=100)
-        self._update_model_status()
-        self._append_log(f"Model '{model}' downloaded and cached.")
+            now = time.monotonic()
+            queue_depth = q.qsize()
+            if queue_depth > 25:
+                print(f"warning: audio queue is {queue_depth * CHUNK_SEC:.1f}s behind")
 
-    def _run_pipeline(self, pipeline: WhisperOverlayPipeline) -> None:
-        pipeline.run()
-        self.root.after(0, self._pipeline_finished, pipeline)
+            if chunk.size:
+                is_speech = float(np.sqrt(np.mean(chunk ** 2))) > args.vad_threshold
+                if not active:
+                    preroll.append(chunk)
+                    if is_speech:
+                        active, silence, last_partial = True, 0.0, now
+                        buf = list(preroll)
+                        preroll.clear()
+                else:
+                    buf.append(chunk)
+                    silence = 0.0 if is_speech else silence + CHUNK_SEC
 
-    def _pipeline_finished(self, pipeline: WhisperOverlayPipeline) -> None:
-        if self.pipeline is pipeline:
-            self.pipeline = None
-            self.start_button.configure(state=tk.NORMAL)
-            self.stop_button.configure(state=tk.DISABLED)
-            self.status.set("Ready")
-
-    def _stop(self) -> None:
-        if self.pipeline is not None:
-            self.status.set("Stopping")
-            self.pipeline.stop()
-
-    def _log_from_thread(self, message: str) -> None:
-        self.root.after(0, self._append_log, message)
-
-    def _append_log(self, message: str) -> None:
-        self.log.configure(state=tk.NORMAL)
-        self.log.insert(tk.END, message + "\n")
-        self.log.see(tk.END)
-        self.log.configure(state=tk.DISABLED)
-
-    def _close(self) -> None:
-        if self.pipeline is not None:
-            self.pipeline.stop()
-        self.root.destroy()
-
-
-def main() -> None:
-    if run_headless_if_requested(sys.argv[1:]):
-        return
-    hide_standalone_console()
-    root = tk.Tk()
-    WhisperOverlayApp(root)
-    root.mainloop()
+            if active:
+                dur = len(buf) * CHUNK_SEC
+                if silence >= args.end_silence or dur >= args.max_utterance:
+                    enqueue_transcription("final", np.concatenate(buf))
+                    buf, active, silence = [], False, 0.0
+                elif now - last_partial >= args.partial_interval and dur >= 0.8:
+                    latest_partial_id = enqueue_transcription("partial", np.concatenate(buf))
+                    last_partial = time.monotonic()
+            elif clear_at and time.monotonic() > clear_at:
+                subs.set("")
+                clear_at = 0.0
+    except KeyboardInterrupt:
+        pass
+    finally:
+        subs.set("")
+        transcription_q.put(None)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        print("Stopped.")
 
 
 if __name__ == "__main__":
