@@ -1,3 +1,4 @@
+import io
 import queue
 import tempfile
 import unittest
@@ -32,7 +33,7 @@ class AppTests(unittest.TestCase):
             gop=50,
             bitrate="3M",
             input="video.mp4",
-            no_loop=False,
+            loop=True,
             output="rtsp://localhost:8554/subtitles",
         )
         subfile = Path("/tmp/subtitles.txt")
@@ -43,7 +44,7 @@ class AppTests(unittest.TestCase):
     def test_build_ffmpeg_cmd_supports_rtsp_output(self):
         args = SimpleNamespace(
             font_size="36", margin=60, font="", encoder="libx264",
-            gop=50, bitrate="3M", input="video.mp4", no_loop=False,
+            gop=50, bitrate="3M", input="video.mp4", loop=False,
             output="rtsp://localhost:8554/subtitles",
         )
         cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))
@@ -51,10 +52,14 @@ class AppTests(unittest.TestCase):
         self.assertIn("rtsp", cmd)
         self.assertIn("rtsp://localhost:8554/subtitles", cmd)
 
+    def test_progress_thread_reports_percentage(self):
+        pipe = io.StringIO("out_time_us=5000000\nprogress=continue\nout_time_us=10000000\nprogress=end\n")
+        app.progress_thread(pipe, 10.0)
+
     def test_build_ffmpeg_cmd_supports_file_output(self):
         args = SimpleNamespace(
             font_size="36", margin=60, font="", encoder="libx264",
-            gop=50, bitrate="3M", input="video.mp4", no_loop=False,
+            gop=50, bitrate="3M", input="video.mp4", loop=False,
             output="/tmp/subtitles.mp4",
         )
         cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))

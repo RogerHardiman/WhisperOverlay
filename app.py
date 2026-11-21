@@ -18,7 +18,8 @@ speed (ffmpeg -re) and looped forever (-stream_loop -1), so it behaves like a li
 Usage:
     python rtsp_live_subtitles.py rtsp://camera/stream rtsp://localhost:8554/subtitled
     python rtsp_live_subtitles.py video.mp4 rtsp://localhost:8554/subtitled
-    python rtsp_live_subtitles.py video.mp4 OUT --no-loop     # play the file once
+    python rtsp_live_subtitles.py video.mp4 OUT                  # play the file once
+    python rtsp_live_subtitles.py video.mp4 OUT --loop           # loop the file
     python rtsp_live_subtitles.py IN OUT --model small.en --language en --device cuda
     python rtsp_live_subtitles.py IN OUT --encoder h264_nvenc
 
@@ -109,7 +110,7 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
         # File source: -re paces reading at native frame rate (real time);
         # -stream_loop -1 repeats forever with continuous timestamps.
         input_opts = ["-re"]
-        if not args.no_loop:
+        if args.loop:
             input_opts += ["-stream_loop", "-1"]
 
     cmd = [
@@ -129,11 +130,73 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
             cmd += ["-movflags", "+faststart"]
         cmd += [args.output]
 
+    if not is_rtsp(args.output) and not is_rtsp(args.input) and not args.loop:
+        cmd += ["-progress", "pipe:2"]
+
     cmd += [
         # Output 2: raw audio to stdout for Whisper
         "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1",
     ]
     return cmd
+
+
+def probe_duration(path: str) -> float:
+    """Return a media file duration in seconds, or 0 when it cannot be determined."""
+    if shutil.which("ffprobe") is None:
+        return 0.0
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return max(0.0, float(result.stdout.strip()))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def progress_thread(pipe, duration: float):
+    """Consume FFmpeg stderr and print percentage progress for finite file runs."""
+    last_percent = -1
+    if duration <= 0:
+        for line in iter(pipe.readline, ""):
+            if line and not line.startswith(("frame=", "out_time=", "progress=")):
+                print(line.rstrip(), file=sys.stderr)
+        return
+
+    values = {}
+    for raw_line in iter(pipe.readline, ""):
+        line = raw_line.strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key] = value
+
+        if key in ("progress", "out_time_us"):
+            elapsed = 0.0
+            if values.get("out_time_us", "").strip():
+                try:
+                    elapsed = float(values["out_time_us"]) / 1_000_000.0
+                except ValueError:
+                    elapsed = 0.0
+            elif values.get("out_time", "").strip():
+                try:
+                    hh, mm, ss = values["out_time"].split(":")
+                    elapsed = float(hh) * 3600 + float(mm) * 60 + float(ss)
+                except (ValueError, AttributeError):
+                    elapsed = 0.0
+
+            percent = min(100, max(0, int(elapsed / duration * 100)))
+            if percent != last_percent:
+                print(f"\rProcessing: {percent}%", end="", file=sys.stderr, flush=True)
+                last_percent = percent
+            if value == "end":
+                print("\rProcessing: 100%", file=sys.stderr)
+                values.clear()
 
 
 def reader_thread(pipe, q: queue.Queue):
@@ -202,9 +265,9 @@ def check_ffmpeg(args, p: argparse.ArgumentParser) -> None:
 
 def main():
     p = argparse.ArgumentParser(description="Realtime Whisper subtitles on an RTSP stream.")
-    p.add_argument("input", help="source: an rtsp:// URL, or a path to an MP4/video file (loops forever, real time)")
+    p.add_argument("input", help="source: an rtsp:// URL, or a path to an MP4/video file (played once unless --loop is used)")
     p.add_argument("output", help="destination RTSP URL or local output file (e.g. rtsp://localhost:8554/subtitled or output.mp4)")
-    p.add_argument("--no-loop", action="store_true", help="play a file source once instead of looping")
+    p.add_argument("--loop", action="store_true", help="loop a local file source continuously")
     p.add_argument("--model", default="base.en", help="tiny/base/small/medium/large-v3/turbo or *.en variants")
     p.add_argument("--device", default="auto", help="auto, cpu or cuda")
     p.add_argument("--compute-type", default="default", help="int8 (CPU), float16 (GPU), ...")
@@ -273,8 +336,12 @@ def main():
 
     cmd = build_ffmpeg_cmd(args, subs.path)
     print("Starting ffmpeg...")
+    progress_duration = 0.0
+    if not is_rtsp(args.output) and not is_rtsp(args.input) and not args.loop:
+        progress_duration = probe_duration(args.input)
+
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as exc:
         shutil.rmtree(tmpdir, ignore_errors=True)
         p.error(f"could not start ffmpeg: {exc}")
@@ -297,6 +364,10 @@ def main():
             transcription_results.put((kind, request_id, text))
 
     threading.Thread(target=reader_thread, args=(proc.stdout, q), daemon=True).start()
+    if progress_duration > 0:
+        threading.Thread(target=progress_thread, args=(proc.stderr, progress_duration), daemon=True).start()
+    else:
+        threading.Thread(target=progress_thread, args=(proc.stderr, 0.0), daemon=True).start()
     threading.Thread(target=transcription_worker, daemon=True).start()
 
     preroll = deque(maxlen=3)
