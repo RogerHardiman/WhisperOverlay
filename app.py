@@ -112,17 +112,28 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
         if not args.no_loop:
             input_opts += ["-stream_loop", "-1"]
 
-    return [
+    cmd = [
         "ffmpeg", "-loglevel", "warning", "-nostats",
         *input_opts,
         "-i", args.input,
-        # Output 1: overlaid video + audio to the RTSP server
+        # Output 1: overlaid video + audio
         "-map", "0:v:0", "-map", "0:a:0?", "-vf", drawtext, *venc,
         "-c:a", "aac", "-b:a", "128k",
-        "-f", "rtsp", "-rtsp_transport", "tcp", args.output,
+    ]
+
+    if is_rtsp(args.output):
+        cmd += ["-f", "rtsp", "-rtsp_transport", "tcp", args.output]
+    else:
+        cmd += ["-y"]
+        if Path(args.output).suffix.lower() in (".mp4", ".mov", ".m4v"):
+            cmd += ["-movflags", "+faststart"]
+        cmd += [args.output]
+
+    cmd += [
         # Output 2: raw audio to stdout for Whisper
         "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1",
     ]
+    return cmd
 
 
 def reader_thread(pipe, q: queue.Queue):
@@ -192,7 +203,7 @@ def check_ffmpeg(args, p: argparse.ArgumentParser) -> None:
 def main():
     p = argparse.ArgumentParser(description="Realtime Whisper subtitles on an RTSP stream.")
     p.add_argument("input", help="source: an rtsp:// URL, or a path to an MP4/video file (loops forever, real time)")
-    p.add_argument("output", help="destination RTSP URL (e.g. rtsp://localhost:8554/subtitled)")
+    p.add_argument("output", help="destination RTSP URL or local output file (e.g. rtsp://localhost:8554/subtitled or output.mp4)")
     p.add_argument("--no-loop", action="store_true", help="play a file source once instead of looping")
     p.add_argument("--model", default="base.en", help="tiny/base/small/medium/large-v3/turbo or *.en variants")
     p.add_argument("--device", default="auto", help="auto, cpu or cuda")
@@ -230,6 +241,12 @@ def main():
 
     if not is_rtsp(args.input) and not Path(args.input).is_file():
         p.error(f"input is neither an rtsp:// URL nor an existing file: {args.input}")
+    if not is_rtsp(args.output):
+        output_path = Path(args.output)
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            p.error(f"could not create output directory: {exc}")
     if np is None:
         p.error("numpy is required; install it with 'pip install numpy'")
     if WhisperModel is None:

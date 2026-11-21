@@ -40,6 +40,29 @@ class AppTests(unittest.TestCase):
         self.assertIn("0:a:0?", cmd)
         self.assertIn("-stream_loop", cmd)
 
+    def test_build_ffmpeg_cmd_supports_rtsp_output(self):
+        args = SimpleNamespace(
+            font_size="36", margin=60, font="", encoder="libx264",
+            gop=50, bitrate="3M", input="video.mp4", no_loop=False,
+            output="rtsp://localhost:8554/subtitles",
+        )
+        cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))
+        self.assertIn("-f", cmd)
+        self.assertIn("rtsp", cmd)
+        self.assertIn("rtsp://localhost:8554/subtitles", cmd)
+
+    def test_build_ffmpeg_cmd_supports_file_output(self):
+        args = SimpleNamespace(
+            font_size="36", margin=60, font="", encoder="libx264",
+            gop=50, bitrate="3M", input="video.mp4", no_loop=False,
+            output="/tmp/subtitles.mp4",
+        )
+        cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))
+        self.assertIn("-y", cmd)
+        self.assertIn("+faststart", cmd)
+        self.assertIn("/tmp/subtitles.mp4", cmd)
+        self.assertNotIn("-rtsp_transport", cmd)
+
 
 if __name__ == "__main__":
     unittest.main()
