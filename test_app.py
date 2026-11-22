@@ -97,6 +97,8 @@ class AppTests(unittest.TestCase):
         cmd = app.build_ffmpeg_cmd(args, subfile)
         self.assertIn("0:a:0?", cmd)
         self.assertIn("-stream_loop", cmd)
+        drawtext = cmd[cmd.index("-vf") + 1]
+        self.assertIn(":x=60:", drawtext)
 
     def test_build_ffmpeg_cmd_supports_rtsp_output(self):
         args = SimpleNamespace(

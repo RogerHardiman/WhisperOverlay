@@ -123,7 +123,7 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
     drawtext = (
         f"drawtext=textfile='{ffmpeg_escape(str(subfile))}':reload=1:expansion=none"
         f":fontcolor=white:fontsize={args.font_size}:borderw=3:bordercolor=black"
-        f":x=(w-text_w)/2:y=h-text_h-{args.margin}:line_spacing=6"
+        f":x={args.margin}:y=h-text_h-{args.margin}:line_spacing=6"
     )
     if args.font:
         drawtext += f":fontfile='{ffmpeg_escape(args.font)}'"
@@ -342,7 +342,7 @@ def main():
     p.add_argument("--hold", type=float, default=3.0, help="seconds to keep text on screen after speech ends")
     # look and encoding
     p.add_argument("--font", default=default_font(), help="path to a .ttf font")
-    p.add_argument("--font-size", default="36")
+    p.add_argument("--font-size", default="10")
     p.add_argument("--margin", type=int, default=60, help="pixels from bottom edge")
     p.add_argument("--wrap", type=int, default=42, help="characters per subtitle line")
     p.add_argument("--encoder", default="libx264", help="libx264, h264_nvenc, h264_qsv, h264_videotoolbox...")
