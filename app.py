@@ -109,7 +109,16 @@ class SubtitleFile:
         self.set("")
 
     def set(self, text: str):
-        text = "\n".join(textwrap.wrap(text.strip(), self.width)[-self.lines:]) or " "
+        cleaned = []
+        for char in text:
+            if char in "\r\n":
+                cleaned.append(char)
+            elif char == "\t":
+                cleaned.append(" ")
+            elif char.isprintable():
+                cleaned.append(char)
+        clean_text = "".join(cleaned).strip().replace("\r\n", "\n").replace("\r", "\n")
+        text = "\n".join(textwrap.wrap(clean_text, self.width)[-self.lines:]) or " "
         if text == self.current:
             return
         tmp = self.path.with_suffix(".tmp")
@@ -146,7 +155,7 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
     cmd = [
         "ffmpeg", "-loglevel", "warning", "-nostats",
     ]
-    if not is_rtsp(args.output) and not is_rtsp(args.input) and not args.loop:
+    if not is_rtsp(args.video_output) and not is_rtsp(args.input) and not args.loop:
         cmd += ["-progress", "pipe:2"]
     cmd += [
         *input_opts,
@@ -156,16 +165,16 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
         "-c:a", "aac", "-b:a", "128k",
     ]
 
-    if is_rtsp(args.output):
-        cmd += ["-f", "rtsp", "-rtsp_transport", "tcp", args.output]
+    if is_rtsp(args.video_output):
+        cmd += ["-f", "rtsp", "-rtsp_transport", "tcp", args.video_output]
     else:
         cmd += ["-y"]
-        output_suffix = Path(args.output).suffix.lower()
+        output_suffix = Path(args.video_output).suffix.lower()
         if output_suffix in (".mp4", ".mov", ".m4v"):
             cmd += ["-movflags", "+faststart"]
         elif output_suffix == ".ts":
             cmd += ["-f", "mpegts"]
-        cmd += [args.output]
+        cmd += [args.video_output]
 
     cmd += [
         # Output 2: raw audio to stdout for Whisper
@@ -322,14 +331,9 @@ def check_ffmpeg(args, p: argparse.ArgumentParser) -> None:
 def main():
     p = argparse.ArgumentParser(description="Realtime Whisper subtitles on an RTSP stream.")
     p.add_argument("input", help="source: an rtsp:// URL, or a path to an MP4/video file (played once unless --loop is used)")
-    p.add_argument(
-        "output",
-        nargs="?",
-        metavar="OVERLAY_DESTINATION",
-        help="required overlay destination: RTSP URL or local output file (omit only with --transcribe-only)",
-    )
+    p.add_argument("--video-output", metavar="OVERLAY_DESTINATION", help="overlay destination: RTSP URL or local output file")
     p.add_argument("--loop", action="store_true", help="loop a local file source continuously")
-    p.add_argument("--transcribe-only", nargs="?", const="", metavar="TXT", help="transcribe a local input to timestamped text instead of creating output media; optional TXT path")
+    p.add_argument("--transcription-output", metavar="TXT", help="write timestamps and transcripts to this text file instead of creating output media")
     p.add_argument("--showtranscriptions", action="store_true", help="print finalized transcripts with UTC timestamps for RTSP sources or relative timestamps for files")
     p.add_argument("--showoverlay", action="store_true", help="print the text strings written to the ffmpeg drawtext overlay")
     p.add_argument(
@@ -374,14 +378,11 @@ def main():
 
     if not is_rtsp(args.input) and not Path(args.input).is_file():
         p.error(f"input is neither an rtsp:// URL nor an existing file: {args.input}")
-    if args.transcribe_only is not None:
-        if args.output:
-            p.error("with --transcribe-only, specify the text file using --transcribe-only TXT, not the positional output")
-    elif args.output is None:
-        p.error("OVERLAY_DESTINATION is required unless --transcribe-only is used")
+    if args.transcription_output is None and args.video_output is None:
+        p.error("specify --video-output OVERLAY_DESTINATION or --transcription-output TXT")
 
-    if args.output is not None and not is_rtsp(args.output):
-        output_path = Path(args.output)
+    if args.video_output is not None and not is_rtsp(args.video_output):
+        output_path = Path(args.video_output)
         if not output_path.suffix:
             p.error("local output files must include a filename extension, such as output.mp4")
         try:
@@ -393,7 +394,7 @@ def main():
     if WhisperModel is None:
         p.error("faster-whisper is required; install it with 'pip install faster-whisper'")
 
-    if args.transcribe_only is None:
+    if args.video_output is not None:
         check_ffmpeg(args, p)
 
     print(f"Loading model {args.model}...")
@@ -402,8 +403,8 @@ def main():
     except Exception as exc:
         p.error(f"could not load Whisper model: {exc}")
 
-    if args.transcribe_only is not None and is_rtsp(args.input):
-        transcript_path = Path(args.transcribe_only) if args.transcribe_only else Path("rtsp_transcript.txt")
+    if args.transcription_output is not None and args.video_output is None and is_rtsp(args.input):
+        transcript_path = Path(args.transcription_output)
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
         transcript_path.write_text("", encoding="utf-8")
         print(f"Transcribing {args.input}...")
@@ -491,8 +492,8 @@ def main():
             print(f"Stopped. Wrote transcript to {transcript_path}")
         return
 
-    if args.transcribe_only is not None:
-        transcript_path = Path(args.transcribe_only) if args.transcribe_only else Path(args.input).with_suffix(".txt")
+    if args.transcription_output is not None and args.video_output is None:
+        transcript_path = Path(args.transcription_output)
         print(f"Transcribing {args.input}...")
         try:
             audio = decode_audio_file(args.input)
@@ -524,11 +525,16 @@ def main():
 
     tmpdir = Path(tempfile.mkdtemp(prefix="rtsp_subs_"))
     subs = SubtitleFile(tmpdir / "subtitle.txt", args.wrap, args.showoverlay, args.overlay_lines)
+    transcript_path = None
+    if args.transcription_output is not None:
+        transcript_path = Path(args.transcription_output)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript_path.write_text("", encoding="utf-8")
 
     cmd = build_ffmpeg_cmd(args, subs.path)
     print("Starting ffmpeg...")
     progress_duration = 0.0
-    if not is_rtsp(args.output) and not is_rtsp(args.input) and not args.loop:
+    if not is_rtsp(args.video_output) and not is_rtsp(args.input) and not args.loop:
         progress_duration = probe_duration(args.input)
 
     try:
@@ -577,7 +583,8 @@ def main():
     latest_partial_id = -1
     run_start = time.monotonic()
     utterance_start = 0.0
-    print(f"Running. Output: {args.output}   (Ctrl+C to stop)")
+    utterance_started_utc = None
+    print(f"Running. Output: {args.video_output}   (Ctrl+C to stop)")
 
     def enqueue_transcription(kind: str, audio: np.ndarray) -> int:
         nonlocal request_id
@@ -618,6 +625,18 @@ def main():
                     subs.set(text)
                     if args.showtranscriptions:
                         print(f"[{format_timestamp(cue_start)} --> {format_timestamp(cue_end)}] {text}", flush=True)
+                    if transcript_path is not None:
+                        if is_rtsp(args.input):
+                            utc_start = utterance_started_utc or datetime.now(timezone.utc)
+                            utc_end = datetime.now(timezone.utc)
+                            start_text = utc_start.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                            end_text = utc_end.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                            line = f"[{start_text} --> {end_text}] {text}\n"
+                        else:
+                            line = f"[{format_timestamp(cue_start)} --> {format_timestamp(cue_end)}] {text}\n"
+                        with transcript_path.open("a", encoding="utf-8") as transcript:
+                            transcript.write(line)
+                            transcript.flush()
                     clear_at = time.monotonic() + args.hold
                 else:
                     subs.set("")
@@ -644,6 +663,7 @@ def main():
                     if is_speech:
                         active, silence, last_partial = True, 0.0, now
                         utterance_start = max(0.0, now - run_start)
+                        utterance_started_utc = datetime.now(timezone.utc)
                         buf = list(preroll)
                         preroll.clear()
                 else:

@@ -86,6 +86,13 @@ class AppTests(unittest.TestCase):
             subs.set("one two three four five six")
             self.assertEqual(path.read_text(encoding="utf-8"), "three four\nfive six")
 
+    def test_subtitle_file_removes_non_printable_characters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "subtitle.txt"
+            subs = app.SubtitleFile(path, 20)
+            subs.set("Hello\x00=\nworld\u200b")
+            self.assertEqual(path.read_text(encoding="utf-8"), "Hello= world")
+
     def test_subtitle_file_prints_overlay_text_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "subtitle.txt"
@@ -105,7 +112,7 @@ class AppTests(unittest.TestCase):
             bitrate="3M",
             input="video.mp4",
             loop=True,
-            output="rtsp://localhost:8554/subtitles",
+            video_output="rtsp://localhost:8554/subtitles",
         )
         subfile = Path("/tmp/subtitles.txt")
         cmd = app.build_ffmpeg_cmd(args, subfile)
@@ -118,7 +125,7 @@ class AppTests(unittest.TestCase):
         args = SimpleNamespace(
             font_size="36", margin=60, font="", encoder="libx264",
             gop=50, bitrate="3M", input="video.mp4", loop=False,
-            output="rtsp://localhost:8554/subtitles",
+            video_output="rtsp://localhost:8554/subtitles",
         )
         cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))
         self.assertIn("-f", cmd)
@@ -143,7 +150,7 @@ class AppTests(unittest.TestCase):
         args = SimpleNamespace(
             font_size="36", margin=60, font="", encoder="libx264",
             gop=50, bitrate="3M", input="video.mp4", loop=False,
-            output="/tmp/subtitles.mp4",
+            video_output="/tmp/subtitles.mp4",
         )
         cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))
         self.assertIn("-y", cmd)
@@ -157,7 +164,7 @@ class AppTests(unittest.TestCase):
         args = SimpleNamespace(
             font_size="36", margin=60, font="", encoder="libx264",
             gop=50, bitrate="3M", input="video.mp4", loop=False,
-            output="/tmp/subtitles.ts",
+            video_output="/tmp/subtitles.ts",
         )
         cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))
         output_index = cmd.index("/tmp/subtitles.ts")
