@@ -102,8 +102,9 @@ def ffmpeg_escape(path: str) -> str:
 class SubtitleFile:
     """Atomically updated text file that ffmpeg's drawtext reloads every frame."""
 
-    def __init__(self, path: Path, width: int):
+    def __init__(self, path: Path, width: int, show_overlay: bool = False):
         self.path, self.width, self.current = path, width, None
+        self.show_overlay = show_overlay
         self.set("")
 
     def set(self, text: str):
@@ -114,6 +115,8 @@ class SubtitleFile:
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, self.path)  # atomic: drawtext never sees a half-written file
         self.current = text
+        if self.show_overlay and text != " ":
+            print(text, flush=True)
 
 
 def build_ffmpeg_cmd(args, subfile: Path) -> list:
@@ -360,7 +363,8 @@ def main():
     )
     p.add_argument("--loop", action="store_true", help="loop a local file source continuously")
     p.add_argument("--transcribe-only", nargs="?", const="", metavar="TXT", help="transcribe a local input to timestamped text instead of creating output media; optional TXT path")
-    p.add_argument("--console", action="store_true", help="print finalized transcripts with UTC timestamps for RTSP sources or relative timestamps for files")
+    p.add_argument("--showtranscriptions", action="store_true", help="print finalized transcripts with UTC timestamps for RTSP sources or relative timestamps for files")
+    p.add_argument("--showoverlay", action="store_true", help="print the text strings written to the ffmpeg drawtext overlay")
     p.add_argument(
         "--model",
         choices=["tiny.en", "base.en", "small.en", "medium.en"],
@@ -504,7 +508,7 @@ def main():
                                 transcript.flush()
                             utc_start = utterance_started_utc or datetime.now(timezone.utc)
                             utc_end = datetime.now(timezone.utc)
-                            if args.console:
+                            if args.showtranscriptions:
                                 start_text = utc_start.isoformat(timespec="milliseconds").replace("+00:00", "Z")
                                 end_text = utc_end.isoformat(timespec="milliseconds").replace("+00:00", "Z")
                                 print(f"[{start_text} --> {end_text}] {text}", flush=True)
@@ -530,7 +534,7 @@ def main():
                 no_speech_threshold=0.6,
             )
             segments = list(segments)
-            if args.console:
+            if args.showtranscriptions:
                 for segment in segments:
                     text = segment.text.strip()
                     if text:
@@ -549,7 +553,7 @@ def main():
         return " ".join(s.text.strip() for s in segments).strip()
 
     tmpdir = Path(tempfile.mkdtemp(prefix="rtsp_subs_"))
-    subs = SubtitleFile(tmpdir / "subtitle.txt", args.wrap)
+    subs = SubtitleFile(tmpdir / "subtitle.txt", args.wrap, args.showoverlay)
 
     cmd = build_ffmpeg_cmd(args, subs.path)
     print("Starting ffmpeg...")
@@ -642,7 +646,7 @@ def main():
                         subs.set(text)
                 elif text:
                     subs.set(text)
-                    if args.console:
+                    if args.showtranscriptions:
                         print(f"[{format_timestamp(cue_start)} --> {format_timestamp(cue_end)}] {text}", flush=True)
                     clear_at = time.monotonic() + args.hold
                 else:

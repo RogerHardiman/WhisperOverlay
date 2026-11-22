@@ -72,6 +72,15 @@ class AppTests(unittest.TestCase):
             subs.set("one two three four five")
             self.assertEqual(path.read_text(encoding="utf-8"), "three four\nfive")
 
+    def test_subtitle_file_prints_overlay_text_when_enabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "subtitle.txt"
+            subs = app.SubtitleFile(path, 20, show_overlay=True)
+            with patch("builtins.print") as print_mock:
+                subs.set("Hello world")
+                subs.set("")
+            print_mock.assert_called_once_with("Hello world", flush=True)
+
     def test_build_ffmpeg_cmd_uses_optional_audio_maps(self):
         args = SimpleNamespace(
             font_size="36",
