@@ -139,6 +139,17 @@ class AppTests(unittest.TestCase):
         self.assertIn("/tmp/subtitles.mp4", cmd)
         self.assertNotIn("-rtsp_transport", cmd)
 
+    def test_build_ffmpeg_cmd_supports_ts_output(self):
+        args = SimpleNamespace(
+            font_size="36", margin=60, font="", encoder="libx264",
+            gop=50, bitrate="3M", input="video.mp4", loop=False,
+            output="/tmp/subtitles.ts",
+        )
+        cmd = app.build_ffmpeg_cmd(args, Path("/tmp/subtitles.txt"))
+        output_index = cmd.index("/tmp/subtitles.ts")
+        self.assertEqual(cmd[output_index - 2:output_index], ["-f", "mpegts"])
+        self.assertNotIn("+faststart", cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -159,8 +159,11 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
         cmd += ["-f", "rtsp", "-rtsp_transport", "tcp", args.output]
     else:
         cmd += ["-y"]
-        if Path(args.output).suffix.lower() in (".mp4", ".mov", ".m4v"):
+        output_suffix = Path(args.output).suffix.lower()
+        if output_suffix in (".mp4", ".mov", ".m4v"):
             cmd += ["-movflags", "+faststart"]
+        elif output_suffix == ".ts":
+            cmd += ["-f", "mpegts"]
         cmd += [args.output]
 
     cmd += [
