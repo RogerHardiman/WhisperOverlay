@@ -333,6 +333,7 @@ def main():
     )
     p.add_argument("--loop", action="store_true", help="loop a local file source continuously")
     p.add_argument("--transcribe-only", nargs="?", const="", metavar="TXT", help="transcribe a local input to timestamped text instead of creating output media; optional TXT path")
+    p.add_argument("--stdout", action="store_true", help="write finalized transcript text to standard output in real time")
     p.add_argument(
         "--model",
         choices=["tiny.en", "base.en", "small.en", "medium.en"],
@@ -413,6 +414,12 @@ def main():
                 condition_on_previous_text=False,
                 no_speech_threshold=0.6,
             )
+            segments = list(segments)
+            if args.stdout:
+                for segment in segments:
+                    text = segment.text.strip()
+                    if text:
+                        print(text, flush=True)
             count = write_timestamped_transcript(transcript_path, segments)
         except Exception as exc:
             p.error(f"transcription failed: {exc}")
@@ -516,6 +523,8 @@ def main():
                         subs.set(text)
                 elif text:
                     subs.set(text)
+                    if args.stdout:
+                        print(text, flush=True)
                     clear_at = time.monotonic() + args.hold
                 else:
                     subs.set("")
