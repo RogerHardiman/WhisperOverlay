@@ -333,7 +333,7 @@ def main():
     )
     p.add_argument("--loop", action="store_true", help="loop a local file source continuously")
     p.add_argument("--transcribe-only", nargs="?", const="", metavar="TXT", help="transcribe a local input to timestamped text instead of creating output media; optional TXT path")
-    p.add_argument("--stdout", action="store_true", help="write finalized transcript text to standard output in real time")
+    p.add_argument("--console", action="store_true", help="print finalized transcripts with UTC timestamps for RTSP sources or relative timestamps for files")
     p.add_argument(
         "--model",
         choices=["tiny.en", "base.en", "small.en", "medium.en"],
@@ -430,6 +430,7 @@ def main():
         silence = 0.0
         run_start = time.monotonic()
         utterance_start = 0.0
+        utterance_started_utc = None
 
         try:
             while True:
@@ -450,6 +451,7 @@ def main():
                         if is_speech:
                             active, silence = True, 0.0
                             utterance_start = max(0.0, now - run_start)
+                            utterance_started_utc = datetime.now(timezone.utc)
                             buf = list(preroll)
                             preroll.clear()
                     else:
@@ -473,9 +475,14 @@ def main():
                             with transcript_path.open("a", encoding="utf-8") as transcript:
                                 transcript.write(line)
                                 transcript.flush()
-                            if args.stdout:
-                                print(text, flush=True)
+                            utc_start = utterance_started_utc or datetime.now(timezone.utc)
+                            utc_end = datetime.now(timezone.utc)
+                            if args.console:
+                                start_text = utc_start.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                                end_text = utc_end.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                                print(f"[{start_text} --> {end_text}] {text}", flush=True)
                         buf, active, silence = [], False, 0.0
+                        utterance_started_utc = None
         except KeyboardInterrupt:
             pass
         finally:
@@ -495,11 +502,11 @@ def main():
                 no_speech_threshold=0.6,
             )
             segments = list(segments)
-            if args.stdout:
+            if args.console:
                 for segment in segments:
                     text = segment.text.strip()
                     if text:
-                        print(text, flush=True)
+                        print(f"[{format_timestamp(float(segment.start))} --> {format_timestamp(float(segment.end))}] {text}", flush=True)
             count = write_timestamped_transcript(transcript_path, segments)
         except Exception as exc:
             p.error(f"transcription failed: {exc}")
@@ -543,13 +550,13 @@ def main():
             job = transcription_q.get()
             if job is None:
                 return
-            kind, request_id, audio = job
+            kind, request_id, audio, cue_start, cue_end = job
             try:
                 text = transcribe(audio)
             except Exception as exc:
                 print(f"warning: transcription failed: {exc}", file=sys.stderr)
                 text = ""
-            transcription_results.put((kind, request_id, text))
+            transcription_results.put((kind, request_id, text, cue_start, cue_end))
 
     threading.Thread(target=reader_thread, args=(proc.stdout, q), daemon=True).start()
     if progress_duration > 0:
@@ -566,12 +573,16 @@ def main():
     clear_at = 0.0
     request_id = 0
     latest_partial_id = -1
+    run_start = time.monotonic()
+    utterance_start = 0.0
     print(f"Running. Output: {args.output}   (Ctrl+C to stop)")
 
     def enqueue_transcription(kind: str, audio: np.ndarray) -> int:
         nonlocal request_id
         request_id += 1
-        job = (kind, request_id, np.ascontiguousarray(audio))
+        cue_end = max(0.0, time.monotonic() - run_start)
+        cue_start = max(0.0, utterance_start)
+        job = (kind, request_id, np.ascontiguousarray(audio), cue_start, cue_end)
         if kind == "final":
             try:
                 transcription_q.put_nowait(job)
@@ -595,7 +606,7 @@ def main():
         while True:
             while True:
                 try:
-                    kind, result_id, text = transcription_results.get_nowait()
+                    kind, result_id, text, cue_start, cue_end = transcription_results.get_nowait()
                 except queue.Empty:
                     break
                 if kind == "partial":
@@ -603,8 +614,8 @@ def main():
                         subs.set(text)
                 elif text:
                     subs.set(text)
-                    if args.stdout:
-                        print(text, flush=True)
+                    if args.console:
+                        print(f"[{format_timestamp(cue_start)} --> {format_timestamp(cue_end)}] {text}", flush=True)
                     clear_at = time.monotonic() + args.hold
                 else:
                     subs.set("")
@@ -630,6 +641,7 @@ def main():
                     preroll.append(chunk)
                     if is_speech:
                         active, silence, last_partial = True, 0.0, now
+                        utterance_start = max(0.0, now - run_start)
                         buf = list(preroll)
                         preroll.clear()
                 else:
