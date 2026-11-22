@@ -109,9 +109,11 @@ class AppTests(unittest.TestCase):
         self.assertIn("rtsp", cmd)
         self.assertIn("rtsp://localhost:8554/subtitles", cmd)
 
-    def test_progress_thread_reports_percentage(self):
+    def test_progress_thread_prints_nothing(self):
         pipe = io.StringIO("out_time_us=5000000\nprogress=continue\nout_time_us=10000000\nprogress=end\n")
-        app.progress_thread(pipe, 10.0)
+        with patch("builtins.print") as print_mock:
+            app.progress_thread(pipe, 10.0)
+        print_mock.assert_not_called()
 
     def test_windows_drive_path_is_escaped(self):
         escaped = app.ffmpeg_escape("C:\\Users\\Roger\\subtitles.txt")

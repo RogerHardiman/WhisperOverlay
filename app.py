@@ -216,50 +216,11 @@ def probe_duration(path: str) -> float:
 
 
 def progress_thread(pipe, duration: float):
-    """Consume FFmpeg stderr and print percentage progress for finite file runs."""
-    last_percent = -1
-    values = {}
-
+    """Consume FFmpeg stderr without writing progress text to the console."""
     while True:
         raw_line = pipe.readline()
         if not raw_line:
             break
-        if isinstance(raw_line, bytes):
-            line = raw_line.decode("utf-8", errors="replace").strip()
-        else:
-            line = raw_line.strip()
-
-        if duration <= 0:
-            if line and not line.startswith(("frame=", "out_time=", "progress=")):
-                print(line, file=sys.stderr)
-            continue
-
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key] = value
-
-        if key in ("progress", "out_time_us"):
-            elapsed = 0.0
-            if values.get("out_time_us", "").strip():
-                try:
-                    elapsed = float(values["out_time_us"]) / 1_000_000.0
-                except ValueError:
-                    elapsed = 0.0
-            elif values.get("out_time", "").strip():
-                try:
-                    hh, mm, ss = values["out_time"].split(":")
-                    elapsed = float(hh) * 3600 + float(mm) * 60 + float(ss)
-                except (ValueError, AttributeError):
-                    elapsed = 0.0
-
-            percent = min(100, max(0, int(elapsed / duration * 100)))
-            if percent != last_percent:
-                print(f"\rProcessing: {percent}%", end="", file=sys.stderr, flush=True)
-                last_percent = percent
-            if value == "end":
-                print("\rProcessing: 100%", file=sys.stderr)
-                values.clear()
 
 
 def stop_ffmpeg(proc: subprocess.Popen, timeout: float = 10.0) -> None:
