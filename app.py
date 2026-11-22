@@ -229,28 +229,30 @@ def progress_thread(pipe, duration: float):
 
 def stop_ffmpeg(proc: subprocess.Popen, timeout: float = 10.0) -> None:
     """Ask FFmpeg to quit gracefully so local muxers can write the MP4 moov atom."""
-    if proc.poll() is not None:
-        return
+    if proc.poll() is None:
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write(b"q\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
 
-    if proc.stdin is not None:
         try:
-            proc.stdin.write(b"q\n")
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError):
-            pass
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
-    try:
-        proc.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except (OSError, ValueError):
+                pass
 
 
 def reader_thread(pipe, q: queue.Queue):

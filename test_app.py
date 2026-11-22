@@ -45,15 +45,22 @@ class AppTests(unittest.TestCase):
 
     def test_stop_ffmpeg_sends_quit_before_wait(self):
         stdin = Mock()
+        stdout = Mock()
+        stderr = Mock()
         proc = Mock()
         proc.poll.return_value = None
         proc.stdin = stdin
+        proc.stdout = stdout
+        proc.stderr = stderr
         proc.wait.return_value = 0
 
         app.stop_ffmpeg(proc)
 
         stdin.write.assert_called_once_with(b"q\n")
         stdin.flush.assert_called_once_with()
+        stdin.close.assert_called_once_with()
+        stdout.close.assert_called_once_with()
+        stderr.close.assert_called_once_with()
         proc.wait.assert_called_once_with(timeout=10.0)
         proc.terminate.assert_not_called()
 
