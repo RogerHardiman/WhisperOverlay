@@ -167,6 +167,32 @@ def build_ffmpeg_cmd(args, subfile: Path) -> list:
     return cmd
 
 
+def decode_audio_file(path: str) -> "np.ndarray":
+    """Decode local media to mono 16 kHz float32 PCM without passing the file path to PyAV."""
+    if np is None:
+        raise RuntimeError("numpy is required")
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is not on PATH")
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", path,
+            "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
+            "-f", "s16le", "pipe:1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(error or f"ffmpeg exited with status {result.returncode}")
+    if not result.stdout:
+        raise RuntimeError("input file contained no decodable audio")
+
+    return np.frombuffer(result.stdout, np.int16).copy().astype(np.float32) / 32768.0
+
+
 def probe_duration(path: str) -> float:
     """Return a media file duration in seconds, or 0 when it cannot be determined."""
     if shutil.which("ffprobe") is None:
@@ -495,8 +521,9 @@ def main():
         transcript_path = Path(args.transcribe_only) if args.transcribe_only else Path(args.input).with_suffix(".txt")
         print(f"Transcribing {args.input}...")
         try:
+            audio = decode_audio_file(args.input)
             segments, _ = model.transcribe(
-                args.input,
+                audio,
                 beam_size=1,
                 vad_filter=True,
                 condition_on_previous_text=False,

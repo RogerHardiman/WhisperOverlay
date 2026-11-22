@@ -2,7 +2,7 @@ import io
 import queue
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +10,25 @@ import app
 
 
 class AppTests(unittest.TestCase):
+    @patch("app.shutil.which", return_value="ffmpeg")
+    @patch("app.subprocess.run")
+    def test_decode_mp4_audio_uses_ffmpeg_pcm(self, run, _which):
+        run.return_value = Mock(
+            returncode=0,
+            stdout=b"\x00\x40\xff\xbf",
+            stderr=b"",
+        )
+
+        audio = app.decode_audio_file("input.mp4")
+
+        command = run.call_args.args[0]
+        self.assertIn("-i", command)
+        self.assertIn("input.mp4", command)
+        self.assertIn("-ar", command)
+        self.assertIn("16000", command)
+        self.assertIn("s16le", command)
+        self.assertEqual(audio.dtype.name, "float32")
+
     def test_format_timestamp(self):
         self.assertEqual(app.format_timestamp(3661.234), "01:01:01.234")
 
