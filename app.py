@@ -102,13 +102,14 @@ def ffmpeg_escape(path: str) -> str:
 class SubtitleFile:
     """Atomically updated text file that ffmpeg's drawtext reloads every frame."""
 
-    def __init__(self, path: Path, width: int, show_overlay: bool = False):
+    def __init__(self, path: Path, width: int, show_overlay: bool = False, lines: int = 3):
         self.path, self.width, self.current = path, width, None
         self.show_overlay = show_overlay
+        self.lines = lines
         self.set("")
 
     def set(self, text: str):
-        text = "\n".join(textwrap.wrap(text.strip(), self.width)[-2:]) or " "  # last 2 lines only
+        text = "\n".join(textwrap.wrap(text.strip(), self.width)[-self.lines:]) or " "
         if text == self.current:
             return
         tmp = self.path.with_suffix(".tmp")
@@ -348,6 +349,7 @@ def main():
     p.add_argument("--font-size", default="10")
     p.add_argument("--margin", type=int, default=60, help="pixels from bottom edge")
     p.add_argument("--wrap", type=int, default=42, help="characters per subtitle line")
+    p.add_argument("--overlay-lines", type=int, default=3, help="maximum number of lines shown in the overlay")
     p.add_argument("--encoder", default="libx264", help="libx264, h264_nvenc, h264_qsv, h264_videotoolbox...")
     p.add_argument("--bitrate", default="3M")
     p.add_argument("--gop", type=int, default=50)
@@ -365,6 +367,8 @@ def main():
         p.error("--hold must be non-negative")
     if args.wrap <= 0:
         p.error("--wrap must be greater than 0")
+    if args.overlay_lines <= 0:
+        p.error("--overlay-lines must be greater than 0")
 
     if not is_rtsp(args.input) and not Path(args.input).is_file():
         p.error(f"input is neither an rtsp:// URL nor an existing file: {args.input}")
@@ -517,7 +521,7 @@ def main():
         return " ".join(s.text.strip() for s in segments).strip()
 
     tmpdir = Path(tempfile.mkdtemp(prefix="rtsp_subs_"))
-    subs = SubtitleFile(tmpdir / "subtitle.txt", args.wrap, args.showoverlay)
+    subs = SubtitleFile(tmpdir / "subtitle.txt", args.wrap, args.showoverlay, args.overlay_lines)
 
     cmd = build_ffmpeg_cmd(args, subs.path)
     print("Starting ffmpeg...")

@@ -69,8 +69,15 @@ class AppTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "subtitle.txt"
             subs = app.SubtitleFile(path, 10)
-            subs.set("one two three four five")
-            self.assertEqual(path.read_text(encoding="utf-8"), "three four\nfive")
+            subs.set("one two three four five six")
+            self.assertEqual(path.read_text(encoding="utf-8"), "one two\nthree four\nfive six")
+
+    def test_subtitle_file_limits_configured_line_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "subtitle.txt"
+            subs = app.SubtitleFile(path, 10, lines=2)
+            subs.set("one two three four five six")
+            self.assertEqual(path.read_text(encoding="utf-8"), "three four\nfive six")
 
     def test_subtitle_file_prints_overlay_text_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
