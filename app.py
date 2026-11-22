@@ -374,8 +374,6 @@ def main():
     if not is_rtsp(args.input) and not Path(args.input).is_file():
         p.error(f"input is neither an rtsp:// URL nor an existing file: {args.input}")
     if args.transcribe_only is not None:
-        if is_rtsp(args.input):
-            p.error("--transcribe-only requires a local input file")
         if args.output:
             p.error("with --transcribe-only, specify the text file using --transcribe-only TXT, not the positional output")
     elif args.output is None:
@@ -402,6 +400,88 @@ def main():
         model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
     except Exception as exc:
         p.error(f"could not load Whisper model: {exc}")
+
+    if args.transcribe_only is not None and is_rtsp(args.input):
+        transcript_path = Path(args.transcribe_only) if args.transcribe_only else Path("rtsp_transcript.txt")
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript_path.write_text("", encoding="utf-8")
+        print(f"Transcribing {args.input}...")
+
+        proc = subprocess.Popen(
+            [
+                "ffmpeg", "-loglevel", "error", "-nostats",
+                "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
+                "-i", args.input,
+                "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE),
+                "-f", "s16le", "pipe:1",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+
+        q: queue.Queue = queue.Queue(maxsize=50)
+        threading.Thread(target=reader_thread, args=(proc.stdout, q), daemon=True).start()
+
+        preroll = deque(maxlen=3)
+        buf: list = []
+        active = False
+        silence = 0.0
+        run_start = time.monotonic()
+        utterance_start = 0.0
+
+        try:
+            while True:
+                try:
+                    chunk = q.get(timeout=0.5)
+                except queue.Empty:
+                    chunk = np.zeros(0, np.float32)
+                    if proc.poll() is not None:
+                        break
+                if chunk is None:
+                    break
+
+                now = time.monotonic()
+                if chunk.size:
+                    is_speech = float(np.sqrt(np.mean(chunk ** 2))) > args.vad_threshold
+                    if not active:
+                        preroll.append(chunk)
+                        if is_speech:
+                            active, silence = True, 0.0
+                            utterance_start = max(0.0, now - run_start)
+                            buf = list(preroll)
+                            preroll.clear()
+                    else:
+                        buf.append(chunk)
+                        silence = 0.0 if is_speech else silence + CHUNK_SEC
+
+                if active:
+                    dur = len(buf) * CHUNK_SEC
+                    if silence >= args.end_silence or dur >= args.max_utterance:
+                        segments, _ = model.transcribe(
+                            np.concatenate(buf),
+                            beam_size=1,
+                            vad_filter=True,
+                            condition_on_previous_text=False,
+                            no_speech_threshold=0.6,
+                        )
+                        text = " ".join(s.text.strip() for s in segments).strip()
+                        if text:
+                            cue_end = max(0.0, time.monotonic() - run_start)
+                            line = f"[{format_timestamp(utterance_start)} --> {format_timestamp(cue_end)}] {text}\n"
+                            with transcript_path.open("a", encoding="utf-8") as transcript:
+                                transcript.write(line)
+                                transcript.flush()
+                            if args.stdout:
+                                print(text, flush=True)
+                        buf, active, silence = [], False, 0.0
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop_ffmpeg(proc)
+            print(f"Stopped. Wrote transcript to {transcript_path}")
+        return
 
     if args.transcribe_only is not None:
         transcript_path = Path(args.transcribe_only) if args.transcribe_only else Path(args.input).with_suffix(".txt")
