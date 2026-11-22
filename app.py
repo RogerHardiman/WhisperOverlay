@@ -20,7 +20,7 @@ Usage:
     python rtsp_live_subtitles.py video.mp4 rtsp://localhost:8554/subtitled
     python rtsp_live_subtitles.py video.mp4 OUT                  # play the file once
     python rtsp_live_subtitles.py video.mp4 OUT --loop           # loop the file
-    python rtsp_live_subtitles.py IN OUT --model small.en --language en --device cuda
+    python rtsp_live_subtitles.py IN OUT --model small.en --device cuda
     python rtsp_live_subtitles.py IN OUT --encoder h264_nvenc
 
 Watch:
@@ -325,14 +325,22 @@ def check_ffmpeg(args, p: argparse.ArgumentParser) -> None:
 def main():
     p = argparse.ArgumentParser(description="Realtime Whisper subtitles on an RTSP stream.")
     p.add_argument("input", help="source: an rtsp:// URL, or a path to an MP4/video file (played once unless --loop is used)")
-    p.add_argument("output", nargs="?", help="destination RTSP URL or local output file (optional with --transcribe-only)")
+    p.add_argument(
+        "output",
+        nargs="?",
+        metavar="OVERLAY_DESTINATION",
+        help="required overlay destination: RTSP URL or local output file (omit only with --transcribe-only)",
+    )
     p.add_argument("--loop", action="store_true", help="loop a local file source continuously")
     p.add_argument("--transcribe-only", nargs="?", const="", metavar="TXT", help="transcribe a local input to timestamped text instead of creating output media; optional TXT path")
-    p.add_argument("--model", default="base.en", help="tiny/base/small/medium/large-v3/turbo or *.en variants")
+    p.add_argument(
+        "--model",
+        choices=["tiny.en", "base.en", "small.en", "medium.en"],
+        default="base.en",
+        help="English-only Whisper model (default: base.en)",
+    )
     p.add_argument("--device", default="auto", help="auto, cpu or cuda")
     p.add_argument("--compute-type", default="default", help="int8 (CPU), float16 (GPU), ...")
-    p.add_argument("--language", default="en", help="language code, or 'auto'")
-    p.add_argument("--task", choices=["transcribe", "translate"], default="transcribe")
     # segmentation
     p.add_argument("--vad-threshold", type=float, default=0.01, help="RMS level counted as speech (0-1)")
     p.add_argument("--end-silence", type=float, default=0.7, help="seconds of silence that end an utterance")
@@ -370,7 +378,7 @@ def main():
         if args.output:
             p.error("with --transcribe-only, specify the text file using --transcribe-only TXT, not the positional output")
     elif args.output is None:
-        p.error("output is required unless --transcribe-only is used")
+        p.error("OVERLAY_DESTINATION is required unless --transcribe-only is used")
 
     if args.output is not None and not is_rtsp(args.output):
         output_path = Path(args.output)
@@ -388,7 +396,6 @@ def main():
     if args.transcribe_only is None:
         check_ffmpeg(args, p)
 
-    lang = None if args.language == "auto" else args.language
     print(f"Loading model {args.model}...")
     try:
         model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
@@ -401,8 +408,6 @@ def main():
         try:
             segments, _ = model.transcribe(
                 args.input,
-                language=lang,
-                task=args.task,
                 beam_size=1,
                 vad_filter=True,
                 condition_on_previous_text=False,
@@ -416,7 +421,7 @@ def main():
 
     def transcribe(audio: np.ndarray) -> str:
         segments, _ = model.transcribe(
-            audio, language=lang, task=args.task, beam_size=1, vad_filter=True,
+            audio, beam_size=1, vad_filter=True,
             condition_on_previous_text=False, no_speech_threshold=0.6,
         )
         return " ".join(s.text.strip() for s in segments).strip()
